@@ -92,8 +92,19 @@ Enter the passcode: jetson
 ### Step 3: Run: sudo nmcli connection up "Tulane IoT"
 *Note that this is for use on the Tulane Campus. You will have to connect to another wifi if elsewhere.
 
-### Step 4: Connection successful
-From here, it should automatically connect to tailscale within a few moments. Refer back to method 1 to connect.
+### Step 4: SSH into the rover
+
+Once Tailscale is running and connected, open a terminal and run:
+
+```bash
+ssh jetson@100.68.244.40
+```
+
+Enter password: `jetson`
+
+You're in! 
+
+---
 
 ## Method 4: SSH via Tulane IoT (Same network only)
 
