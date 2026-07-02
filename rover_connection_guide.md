@@ -79,8 +79,23 @@ Enter password: `jetson`
 > This IP is fixed and hardwired — it always works over USB regardless of network state.
 
 ---
+## Method 3: SSH via Access Popup
+Sometimes, the rover will not connect to Tulane IoT in a timely manner, or sometimes at all, upon rebooting after being shut off for awhile. In this case, it is possible to connect to a hotspot that Jetson automatically boots upon startup named, "Access Popup".
 
-## Method 3: SSH via Tulane IoT (Same network only)
+### Step 1: Connect to Access Popup network. 
+
+Find Access Popup among the available wifi networks. The password is: 1234567890
+
+### Step 2: Open the terminal and run: ssh jetson@ . 
+Enter the passcode: jetson
+
+### Step 3: Run: sudo nmcli connection up "Tulane IoT"
+*Note that this is for use on the Tulane Campus. You will have to connect to another wifi if elsewhere.
+
+### Step 4: Connection successful
+From here, it should automatically connect to tailscale within a few moments. Refer back to method 1 to connect.
+
+## Method 4: SSH via Tulane IoT (Same network only)
 
 If your device is also connected to the **Tulane IoT** network, you can connect directly:
 
