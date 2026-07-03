@@ -144,6 +144,11 @@ SEG_RUN_INTERVAL = 10                   # run segmentation every N steps (2s at 
 SEG_ROCK_PENALTY = 50                   # penalty scale for rock density
 SEG_SIGMOID_WIDTH = 0.5                 # sigmoid sharpness for feasibility score
 
+# ImageNet normalization stats — required to match TerrainSegmenter's training
+# preprocessing (LuSNAR training script normalized with these same values).
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
 
 # ---------------------------------------------------------------------------
 # Face Tracker
@@ -980,53 +985,72 @@ class DummyDetector:
 
 
 # ---------------------------------------------------------------------------
-# Terrain Segmenter (Mark's UNet)
+# Terrain Segmenter (LuSNAR 5-class MobileNetV3 UNet)
 # ---------------------------------------------------------------------------
 
 class TerrainSegmenter:
-    """Runs Mark's UNet lunar terrain segmentation model.
+    """Runs the LuSNAR-trained MobileNetV3 UNet lunar terrain segmentation model.
 
-    Classes: 0=ground, 1=sky, 2=small rock, 3=big rock
-    Returns a feasibility score (0-1) for overall, left, and right halves.
+    Raw pixel value -> class index -> semantic label (from CLASS_MAPPING):
+        31  -> 0 -> big hills   (treated like old "big rock" - hazard)
+        80  -> 1 -> rocks       (treated like old "small rock" - lesser hazard)
+        156 -> 2 -> ground      (driveable)
+        200 -> 3 -> craters     (currently ignored - no policy yet)
+        248 -> 4 -> sky         (ignored - background, not an obstacle)
+
+    Returns a feasibility score (0-1) for overall, left, and right halves,
+    same interface as the old 4-class version so rl_deploy.py doesn't need
+    changes anywhere else.
     """
+
+    # Class indices from CLASS_MAPPING = {31:0, 80:1, 156:2, 200:3, 248:4}
+    CLASS_BIG_HILL = 0
+    CLASS_ROCK = 1
+    CLASS_GROUND = 2
+    CLASS_CRATER = 3   # not used in feasibility yet - reserved for future policy
+    CLASS_SKY = 4       # not used in feasibility - background only
 
     def __init__(self, model_path):
         import torch
         import segmentation_models_pytorch as smp
         self.torch = torch
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.model = smp.Unet(
-            encoder_name="mobilenet_v2",
-            encoder_weights=None,
+            encoder_name="timm-mobilenetv3_small_100",
+            encoder_weights=None,   # weights come from checkpoint, not ImageNet, at inference
             in_channels=3,
-            classes=4,
+            classes=5,
         ).to(self.device)
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
+
         self._last_result = (0.8, 0.8, 0.8)
-        self._last_mask = None  # store last segmentation mask for visualization
-        print(f"[OK] Terrain segmenter loaded on {self.device}")
+        self._last_mask = None
+        print(f"[OK] Terrain segmenter (5-class MobileNetV3) loaded on {self.device}")
 
     def analyze(self, rgb_frame):
         """Run segmentation on RGB frame.
 
         Returns (overall_feasibility, left_feasibility, right_feasibility).
-        Scores are 0-1 where 1 = clear ground, 0 = very rocky.
+        Scores are 0-1 where 1 = clear ground, 0 = very hazardous.
         """
         import cv2
         if rgb_frame is None:
             return self._last_result
 
-        # Resize to model's training resolution (480x720)
-        resized = cv2.resize(rgb_frame, (720, 480))
-        # Normalize to [0,1] float32, NCHW
+        # Match training preprocessing: 256x256, ImageNet normalization
+        resized = cv2.resize(rgb_frame, (256, 256))
         img = resized.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))  # HWC → CHW
-        tensor = self.torch.from_numpy(img).unsqueeze(0).to(self.device)
+        img = (img - IMAGENET_MEAN) / IMAGENET_STD
+        img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
+        tensor = self.torch.from_numpy(img).unsqueeze(0).float().to(self.device)
 
         with self.torch.no_grad():
             output = self.model(tensor)
-        mask = output.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)  # (480, 720)
+        mask = output.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)  # (256, 256)
         self._last_mask = mask
 
         overall = self._compute_feasibility(mask)
@@ -1037,19 +1061,22 @@ class TerrainSegmenter:
         self._last_result = (overall, left_feas, right_feas)
         return self._last_result
 
-    @staticmethod
-    def _compute_feasibility(mask_region):
+    @classmethod
+    def _compute_feasibility(cls, mask_region):
         """Compute feasibility score from a segmentation mask region.
-        Lower rock density → higher feasibility (closer to 1)."""
-        counts = np.bincount(mask_region.flatten(), minlength=4)
-        ground = max(counts[0], 1)
-        small_rock = counts[2]
-        big_rock = counts[3]
-        rock_ratio = (small_rock + 2 * big_rock) / ground
-        # score: 1.0 when no rocks, approaches 0 as rock density increases
-        score = 1.0 / (1.0 + rock_ratio * SEG_ROCK_PENALTY)
-        # Sigmoid smoothing: maps score [0,1] → feasibility [~0, ~1]
-        # score=1 → 1/(1+exp(-5)) ≈ 0.993, score=0 → 1/(1+exp(5)) ≈ 0.007
+        Lower hazard density -> higher feasibility (closer to 1).
+
+        Craters (class 3) and sky (class 4) are currently excluded from
+        the hazard calculation - craters have no avoidance policy yet,
+        and sky is background, not a driving hazard.
+        """
+        counts = np.bincount(mask_region.flatten(), minlength=5)
+        ground = max(counts[cls.CLASS_GROUND], 1)
+        small_hazard = counts[cls.CLASS_ROCK]       # rocks, like old "small rock"
+        big_hazard = counts[cls.CLASS_BIG_HILL]     # big hills, like old "big rock"
+
+        hazard_ratio = (small_hazard + 2 * big_hazard) / ground
+        score = 1.0 / (1.0 + hazard_ratio * SEG_ROCK_PENALTY)
         return float(1.0 / (1.0 + np.exp(-(score * 10.0 - 5.0))))
 
     @property
@@ -1058,7 +1085,7 @@ class TerrainSegmenter:
 
 
 class DummySegmenter:
-    """No-op when segmentation is disabled."""
+    """No-op when segmentation is disabled (or fails to load)."""
     def analyze(self, rgb_frame):
         return (0.8, 0.8, 0.8)
 
@@ -2245,12 +2272,18 @@ class RLDeployController:
                         cv2.imwrite(os.path.join(self.frame_dir, 'depth.jpg'), _dc,
                                     [cv2.IMWRITE_JPEG_QUALITY, 40])
                         # Segmentation overlay — write when available
+                        # 5-class color map matches TerrainSegmenter class indices:
+                        #   0=big hill(red) 1=rock(orange) 2=ground(gray) 3=crater(purple) 4=sky(blue)
                         if (hasattr(self, 'segmenter') and self.segmenter
                                 and hasattr(self.segmenter, '_last_mask')
                                 and self.segmenter._last_mask is not None):
                             _seg_colors = np.array([
-                                [50, 50, 50], [255, 80, 80],
-                                [0, 200, 0], [0, 0, 255]], dtype=np.uint8)
+                                [255, 80, 80],    # 0: big hill - hazard (red)
+                                [255, 165, 0],    # 1: rock - hazard (orange)
+                                [50, 50, 50],     # 2: ground - driveable (dark gray)
+                                [128, 0, 255],    # 3: crater - unused in policy (purple)
+                                [135, 206, 235],  # 4: sky - background (light blue)
+                            ], dtype=np.uint8)
                             _mask = self.segmenter._last_mask
                             _seg = _seg_colors[_mask]
                             _seg_rgb = _rgb if _rgb is not None else np.zeros(
