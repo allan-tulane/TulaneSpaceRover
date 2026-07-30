@@ -9,10 +9,10 @@ printing to the terminal:
     +----------------------+----------------------+
     |   Rover Camera Image | Terrain Segmentation  |
     +----------------------+----------------------+
-    |   Cost Map            |  LingBot Memory Map  |
+    |   Cost Map            |  Persistent World Memory  |
     +----------------------+----------------------+
     Mission decision text printed below the panel.
-    
+
 Usage:
     python3 lunar_demo_dashboard.py                  # save PNGs, no live window
     python3 lunar_demo_dashboard.py --show            # also open a live cv2 window
@@ -31,7 +31,7 @@ import numpy as np
 from rl_deploy import TerrainSegmenter, DummySegmenter
 from terrain_costmap import TerrainCostMapper
 from science_targeting import RockTargetSelector
-
+from persistent_world_map import PersistentWorldMemory
 
 # ----------------------------
 # Configuration
@@ -102,6 +102,23 @@ def placeholder_panel(w, h, lines):
     return panel
 
 
+def render_world_grid(world_grid, origin_offset_px, caption, w=PANEL_CELL_W, h=PANEL_CELL_H):
+    """Actually visualize world_grid (or any grid with
+    the same -1=unseen / 0-255=cost convention) as a colorized top-down
+    image, instead of just reporting a text status."""
+    vis_grid = np.where(world_grid < 0, 0, world_grid).astype(np.uint8)
+    vis = cv2.applyColorMap(vis_grid, cv2.COLORMAP_JET)
+    vis[world_grid < 0] = (40, 40, 40)  # unseen cells: flat grey
+    if 0 <= origin_offset_px < vis.shape[0] and 0 <= origin_offset_px < vis.shape[1]:
+        cv2.drawMarker(vis, (origin_offset_px, origin_offset_px), (255, 255, 255),
+                        markerType=cv2.MARKER_TRIANGLE_UP, markerSize=10, thickness=2)
+    vis = cv2.resize(vis, (w, h), interpolation=cv2.INTER_NEAREST)
+    cv2.rectangle(vis, (0, h - 22), (w - 1, h - 1), (20, 20, 20), -1)
+    cv2.putText(vis, caption, (6, h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                (255, 255, 255), 1, cv2.LINE_AA)
+    return vis
+
+
 def build_panel(rgb, seg_color, cost_color, lingbot_panel, decision_text, obs_label):
     top = np.hstack([
         fit_cell(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), label=f"{obs_label} - Rover Camera"),
@@ -109,7 +126,7 @@ def build_panel(rgb, seg_color, cost_color, lingbot_panel, decision_text, obs_la
     ])
     bottom = np.hstack([
         fit_cell(cost_color, label="Cost Map (perspective-space, no depth)"),
-        fit_cell(lingbot_panel, label="LingBot Memory Map"),
+        fit_cell(lingbot_panel, label="Persistent World Memory"),
     ])
     grid = np.vstack([top, bottom])
 
@@ -130,16 +147,6 @@ def main():
     parser.add_argument("--image-dir", default=IMAGE_DIR)
     parser.add_argument("--model-path", default=SEG_MODEL)
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
-    parser.add_argument("--lingbot-model", default=None,
-                         help="Path to LingBot-Map checkpoint. If set (with "
-                              "--lingbot-dir), the dashboard actually loads "
-                              "LingBot-Map and shows its real init/batch "
-                              "status in the memory panel.")
-    parser.add_argument("--lingbot-dir", default=None,
-                         help="Path where the lingbot-map repo was cloned.")
-    parser.add_argument("--lingbot-workdir", default=None,
-                         help="Scratch dir for LingBot keyframes/batches "
-                              "(default: ./lingbot_scratch next to this script)")
     args = parser.parse_args()
 
     print("\n=== LUNAR ROVER DASHBOARD DEMO STARTING ===\n")
@@ -156,26 +163,10 @@ def main():
     science = RockTargetSelector(preferred_class="big")
     cost_mapper = TerrainCostMapper(map_resolution_m_per_px=0.05, rover_radius_m=0.25)
 
-    # --- Real LingBot-Map init (only if you passed the flags) ---
-    # This is genuine LingBot code executing on this hardware, not a mock.
-    # It does NOT force full reconstruction to succeed — the panel just
-    # honestly reports whatever state it's actually in.
-    memory_mapper = None
-    lingbot_init_error = None
-    if args.lingbot_model and args.lingbot_dir:
-        try:
-            from lingbot_memory_map import LingbotMemoryMapper
-            workdir = args.lingbot_workdir or os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "lingbot_scratch")
-            memory_mapper = LingbotMemoryMapper(
-                model_path=args.lingbot_model,
-                lingbot_dir=args.lingbot_dir,
-                workdir=workdir,
-            )
-            print("[OK] LingBot-Map memory mapper initialized")
-        except Exception as e:
-            lingbot_init_error = str(e)
-            print(f"[WARN] LingBot-Map memory mapper unavailable: {e}")
+    memory_mapper = PersistentWorldMemory(
+    grid_size_m=20.0,
+    cell_size_m=0.05,
+    )
 
     legend = make_legend(PANEL_CELL_W, PANEL_CELL_H)
 
@@ -213,13 +204,37 @@ def main():
 
         if mask is not None:
             seg_color = colorize_mask(mask)
+        
             cost_grid = cost_mapper.generate(mask)
             cost_color = cv2.applyColorMap(cost_grid, cv2.COLORMAP_JET)
+        
+            # ---------------------------------
+            # Synthetic rover motion for demo
+            # ---------------------------------
+            rover_x = i * 0.25
+            rover_y = 0.0
+            rover_heading = 0.0
+        
+            memory_mapper.update_from_reactive(
+                reactive_grid=cost_grid,
+                reactive_rover_row=cost_grid.shape[0] // 2,
+                reactive_rover_col=cost_grid.shape[1] // 2,
+                reactive_resolution_m=0.05,
+                rover_x=rover_x,
+                rover_y=rover_y,
+                rover_heading=rover_heading,
+            )
         else:
-            seg_color = placeholder_panel(PANEL_CELL_W, PANEL_CELL_H,
-                                           ["segmentation unavailable"])
-            cost_color = placeholder_panel(PANEL_CELL_W, PANEL_CELL_H,
-                                            ["cost map unavailable"])
+            seg_color = placeholder_panel(
+                PANEL_CELL_W,
+                PANEL_CELL_H,
+                ["segmentation unavailable"],
+            )
+            cost_color = placeholder_panel(
+                PANEL_CELL_W,
+                PANEL_CELL_H,
+                ["cost map unavailable"],
+            )
 
         # ---- Science targeting ----
         target = science.find_target(mask, None) if mask is not None else None
@@ -252,38 +267,11 @@ def main():
         decision_lines.append(f"Mission decision: -> {decision}")
         decision_text = "\n".join(decision_lines)
 
-        # ---- LingBot memory panel: real status, not a mock ----
-        if memory_mapper is not None:
-            # SYNTHETIC odometry: these demo images have no real trajectory,
-            # so this is just a steadily-incrementing x to exercise the
-            # keyframe/batch pipeline. Not a real drive, and the panel says so.
-            memory_mapper.maybe_capture(i, rgb, i * 0.5, 0.0, 0.0)
-            status_lines = [
-                "LingBot-Map: mapper object built",
-                "(model_path/repo not verified until",
-                "the first batch attempt runs - see",
-                "Batch status below for real proof)",
-                f"Batch status: {memory_mapper.last_batch_status}",
-            ]
-            if memory_mapper.last_batch_error:
-                status_lines.append(f"Last error: {memory_mapper.last_batch_error[:60]}")
-            status_lines.append("(odometry fed to it is SYNTHETIC -")
-            status_lines.append("these images aren't a real trajectory)")
-            lingbot_panel = placeholder_panel(PANEL_CELL_W, PANEL_CELL_H, status_lines)
-        elif lingbot_init_error:
-            lingbot_panel = placeholder_panel(
-                PANEL_CELL_W, PANEL_CELL_H,
-                ["LingBot-Map: init failed", lingbot_init_error[:70]],
-            )
-        else:
-            lingbot_panel = placeholder_panel(
-                PANEL_CELL_W, PANEL_CELL_H,
-                [
-                    "LingBot-Map not configured for",
-                    "this run. Pass --lingbot-model",
-                    "and --lingbot-dir to load it for real.",
-                ],
-            )
+        lingbot_panel = render_world_grid(
+        memory_mapper.world_grid,
+        memory_mapper.origin_offset_px,
+        "Persistent World Memory"
+        )
 
         panel = build_panel(rgb, seg_color, cost_color, lingbot_panel,
                              decision_text, obs_label)
@@ -292,10 +280,16 @@ def main():
         cv2.imwrite(out_path, panel)
 
         if args.show:
-            cv2.imshow("Lunar Rover Dashboard", panel)
-            key = cv2.waitKey(0) & 0xFF
-            if key == ord("q"):
-                break
+            try:
+                cv2.imshow("Lunar Rover Dashboard", panel)
+                key = cv2.waitKey(0) & 0xFF
+                if key == ord("q"):
+                    break
+            except cv2.error as e:
+                print(f"[WARN] --show unavailable on this OpenCV build ({e}). "
+                      f"Continuing without a live window - panels are still "
+                      f"being saved to {args.output_dir}")
+                args.show = False
 
     if args.show:
         cv2.destroyAllWindows()
