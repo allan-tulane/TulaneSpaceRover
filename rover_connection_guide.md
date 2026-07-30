@@ -86,7 +86,7 @@ Sometimes, the rover will not connect to Tulane IoT in a timely manner, or somet
 
 Find Access Popup among the available wifi networks. The password is: 1234567890
 
-### Step 2: Open the terminal and run: ssh jetson@ . 
+### Step 2: Open the terminal and run: ssh jetson@10.42.0.1
 Enter the passcode: jetson
 
 ### Step 3: Run: sudo nmcli connection up "Tulane IoT"
