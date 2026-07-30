@@ -329,8 +329,12 @@ class CameraManager:
         # Segmentation uses PyTorch on RGB frames — runs in a SEPARATE thread
         # because inference takes ~1.7s on Jetson CPU and would block all feeds.
         segmenter = None
-        seg_colors = np.array([
-            [50, 50, 50], [255, 80, 80], [0, 200, 0], [0, 0, 255]
+        _seg_colors = np.array([
+            [180,120,60],    # 0: regolith
+            [255,0,0],       # 1: big rocks
+            [120,120,120],   # 2: small rocks
+            [255,255,0],     # 3: craters
+            [255,255,255],   # 4: sky
         ], dtype=np.uint8)
 
         if self._enable_seg and self._seg_model_path:
@@ -352,6 +356,14 @@ class CameraManager:
             print(f"[CAM] Segmentation disabled (enable_seg={self._enable_seg}, "
                   f"model_path={self._seg_model_path})", flush=True)
 
+        seg_colors = np.array([
+            [255, 0, 0],       # class 0
+            [0, 200, 0],       # class 1
+            [50, 50, 50],      # class 2
+            [120, 0, 200],     # class 3
+            [80, 80, 255],     # class 4
+        ], dtype=np.uint8)
+        
         # Start seg worker thread — runs inference asynchronously
         seg_input_frame = [None]   # shared: capture loop writes, seg thread reads
         seg_input_lock = threading.Lock()

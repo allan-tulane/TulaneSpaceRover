@@ -42,6 +42,10 @@ import argparse
 import math
 import csv
 import numpy as np
+from terrain_costmap import TerrainCostMapper, EgoCostMapper
+from persistent_world_map import PersistentWorldMemory
+
+from science_targeting import RockTargetSelector, RockTarget
 
 # Add ugv_jetson to path for base_ctrl and cv_ctrl
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ugv_jetson'))
@@ -140,9 +144,45 @@ RED_MIN_AREA_FRAC = 0.002              # minimum fraction of frame area to count
 RED_STOP_DISTANCE = 0.10               # meters — stop RIGHT next to the target (10cm)
 
 # Terrain segmentation
-SEG_RUN_INTERVAL = 10                   # run segmentation every N steps (2s at 5Hz)
+SEG_RUN_INTERVAL = 5                   # run segmentation every N steps (2s at 5Hz)
 SEG_ROCK_PENALTY = 50                   # penalty scale for rock density
 SEG_SIGMOID_WIDTH = 0.5                 # sigmoid sharpness for feasibility score
+
+# ---------------------------------------------------------------------------
+# Costmap Path Planning
+# ---------------------------------------------------------------------------
+
+COSTMAP_RESOLUTION = 0.05        # meters per cell
+COSTMAP_GRID_SIZE = 5.0          # 5x5 m local map
+ROVER_RADIUS_M = 0.35
+
+PATH_LOOKAHEAD_M = 2.0           # evaluate 2 meters ahead
+PATH_STEP_M = 0.10               # integrate every 10 cm
+
+NUM_CANDIDATE_HEADINGS = 21      # odd number so straight ahead is included
+MAX_HEADING_RAD = math.radians(60)
+
+UNKNOWN_COST_WEIGHT = 255
+
+COSTMAP_STEERING_GAIN = 0.5
+MAX_COSTMAP_CORRECTION = 0.3
+
+# ---------------------------------------------------------------------------
+# LingBot-Map Persistent Memory Mapping
+# ---------------------------------------------------------------------------
+# Per the hardware checks earlier in this project (aarch64 Jetson, 4GB total
+# RAM, CPU-only PyTorch, no CUDA toolkit installed) — this is genuinely
+# unconfirmed to run at all on this board. It's wired in per explicit
+# direction to proceed anyway; see LingbotMemoryMapper's docstring for the
+# fallback behavior if a batch run fails, times out, or the .npz output
+# schema doesn't match what's expected.
+LINGBOT_MAP_SIZE_M = 20.0            # persistent world-frame grid extent
+LINGBOT_CELL_SIZE_M = 0.10
+LINGBOT_KEYFRAME_INTERVAL_STEPS = 25  # 5s at 5Hz — memory mapping is not real-time
+LINGBOT_BATCH_SIZE = 40              # keyframes per reconstruction batch
+LINGBOT_MIN_KEYFRAMES_ALIGN = 3      # min keyframes to align LingBot poses to odometry
+LINGBOT_OBSTACLE_HEIGHT_M = 0.15     # points this far above local ground = obstacle
+LINGBOT_SUBPROCESS_TIMEOUT_S = 600
 
 # ImageNet normalization stats — required to match TerrainSegmenter's training
 # preprocessing (LuSNAR training script normalized with these same values).
@@ -1004,11 +1044,16 @@ class TerrainSegmenter:
     """
 
     # Class indices from CLASS_MAPPING = {31:0, 80:1, 156:2, 200:3, 248:4}
-    CLASS_BIG_HILL = 0
-    CLASS_ROCK = 1
-    CLASS_GROUND = 2
-    CLASS_CRATER = 3   # not used in feasibility yet - reserved for future policy
-    CLASS_SKY = 4       # not used in feasibility - background only
+    # NOTE: this used to read CLASS_BIG_HILL=0 / CLASS_GROUND=2, which does
+    # NOT match the order terrain_costmap.py's TerrainCostMapper uses (and
+    # was confirmed correct there: 0=regolith, 1=big rock, 2=small rock).
+    # That mismatch meant this class's own feasibility score was scoring
+    # actual ground as a hazard and vice versa. Fixed to match.
+    CLASS_GROUND = 0     # regolith / flat ground - driveable
+    CLASS_BIG_ROCK = 1   # major hazard
+    CLASS_SMALL_ROCK = 2 # lesser hazard
+    CLASS_CRATER = 3     # hazard - no dedicated policy tuning yet
+    CLASS_SKY = 4         # not used in feasibility - background only
 
     def __init__(self, model_path):
         import torch
@@ -1063,25 +1108,26 @@ class TerrainSegmenter:
 
     @classmethod
     def _compute_feasibility(cls, mask_region):
-        """Compute feasibility score from a segmentation mask region.
-        Lower hazard density -> higher feasibility (closer to 1).
-
-        Craters (class 3) and sky (class 4) are currently excluded from
-        the hazard calculation - craters have no avoidance policy yet,
-        and sky is background, not a driving hazard.
-        """
+    
         counts = np.bincount(mask_region.flatten(), minlength=5)
-        ground = max(counts[cls.CLASS_GROUND], 1)
-        small_hazard = counts[cls.CLASS_ROCK]       # rocks, like old "small rock"
-        big_hazard = counts[cls.CLASS_BIG_HILL]     # big hills, like old "big rock"
-
-        hazard_ratio = (small_hazard + 2 * big_hazard) / ground
-        score = 1.0 / (1.0 + hazard_ratio * SEG_ROCK_PENALTY)
-        return float(1.0 / (1.0 + np.exp(-(score * 10.0 - 5.0))))
-
-    @property
-    def last_result(self):
-        return self._last_result
+    
+        total = mask_region.size
+    
+        big_rocks = counts[cls.CLASS_BIG_ROCK]
+        small_rocks = counts[cls.CLASS_SMALL_ROCK]
+        craters = counts[cls.CLASS_CRATER]
+    
+        hazard = (
+            2.0 * big_rocks +
+            1.0 * small_rocks +
+            2.5 * craters
+        )
+    
+        hazard_ratio = hazard / max(total,1)
+    
+        feasibility = 1.0 - hazard_ratio
+    
+        return float(np.clip(feasibility,0.0,1.0))
 
 
 class DummySegmenter:
@@ -1725,19 +1771,101 @@ class DummyRewardLogger:
 class RLDeployController:
     """Main deployment controller: camera -> model -> rover."""
 
+
+    def _compute_costmap_bias(self):
+        if self.latest_costmap is None:
+            return 0.0
+    
+        heading = self._plan_costmap_heading()
+    
+        return heading
+    
+    def _point_gimbal_at_science_target(self, science_target):
+        """
+        Point the camera/laser gimbal at a science target, pause briefly,
+        then return the gimbal to center.
+        
+        This is intentionally conservative because the RL model expets
+        forward-facing depth for navigation.
+        """
+        if not self.science_point_gimbal:
+            return
+        
+        if science_target is None:
+            return
+        
+        if self.dry_run:
+            print(
+                f"  [SCIENCE-DRY-RUN] Would point gimbal to "
+                f"pan={science_target.pan_deg:+.1f}deg "
+                f"tilt={science_target.tilt_deg:+.1f}deg",
+                flush=True,
+            )
+            return
+        
+        try: 
+            pan = int(round(science_target.pan_deg))
+            tilt = int(round(science_target.tilt_deg))
+
+            # Conservative safety limits
+            pan = max(-70, min(70, pan))
+            tilt = max(-25, min(25, tilt))
+
+            print(
+                f"  [SCIENCE] Pointing gimbal: pan={pan:+d}deg tilt={tilt:+d}deg",
+                flush=True,
+            )
+            
+
+            # Stop rover motion while the camera/laser is pointed away from center.
+            self._stop_rover()
+
+            # Point at target.
+            self.base.gimbal_ctrl(pan, tilt, 60, 40)
+            time.sleep(self.science_dwell_time)
+
+
+            #Recenter before navigation continues.
+            self.base.gimbal_ctrl(0, 0, 0, 0)
+            time.sleep(0.3)
+
+            print("   [SCIENCE] Gimbal re-centered", flush=True)
+
+        except Exception as e:
+            print(f"   [WARN] Science gimbal pointing failed: {e}", flush=True)
+            try:
+                self.base.gimbal_ctrl(0, 0, 0, 0)
+            except Exception:
+                pass
+
+        
     def __init__(self, model_path, demo=False, max_speed=MAX_LINEAR_SPEED,
                  dry_run=False, port=SERIAL_PORT, enable_detect=True,
                  enable_gimbal=True, target_mode='distance',
                  enable_segmentation=False, seg_model_path=None,
                  face_stop_distance=FACE_STOP_DISTANCE,
                  log_rewards=False, reward_log_path=None,
-                 frame_dir=None):
+                 frame_dir=None, enable_science_targeting=False, rock_class="big",
+                 science_min_distance=0.5,
+                 science_max_distance=2.5,
+                 laser_pan_offset=0.0,
+                 laser_tilt_offset=0.0,
+                 science_target_interval=5.0,
+                 science_log_path=None,
+                 science_point_gimbal=False,
+                 science_dwell_time=1.0,
+                 test_red_target=False,
+                 enable_lingbot_mapping=False,
+                 lingbot_model_path=None,
+                 lingbot_dir=None,
+                 lingbot_workdir=None,):
         self.max_speed = min(abs(max_speed), MAX_LINEAR_SPEED)
         self.dry_run = dry_run
         self.running = False
         self.base = None
         self.target_mode = target_mode
         self.frame_dir = frame_dir  # if set, writes camera frames for web UI
+        self.test_red_target = test_red_target
 
         # Avoidance state machine
         self._avoid_turn_dir = 0
@@ -1753,20 +1881,27 @@ class RLDeployController:
         self.obstacle_map = ObstacleMemory()
 
         # --- Load the trained model ---
+        self.model = None
         print(f"[INFO] Loading model from: {model_path}")
+
         try:
             from stable_baselines3 import PPO
-            self.model = PPO.load(model_path, device='cpu')
-            print(f"[OK] Model loaded successfully")
-            print(f"     Observation space: {self.model.observation_space}")
-            print(f"     Action space: {self.model.action_space}")
+
+            self.model = PPO.load(model_path, device="cpu")
+
+            print("[OK] Model loaded successfully")
+            print(f"    Observation space: {self.model.observation_space}")
+            print(f"    Action space: {self.model.action_space}")
+        
         except Exception as e:
             print(f"[ERROR] Could not load model: {e}")
             sys.exit(1)
 
+                
+
         # --- Initialize camera ---
         # Face/red mode needs RGB even if detection is off
-        needs_rgb = enable_detect or target_mode in ('face', 'red') or enable_segmentation
+        needs_rgb = enable_detect or target_mode in ('face', 'red') or enable_segmentation or self.test_red_target
         if demo:
             self.camera = DummyDepthCamera()
         else:
@@ -1816,6 +1951,11 @@ class RLDeployController:
         self.destination = DestinationTracker(self.odom)
 
         # --- Initialize face/red target navigation ---
+        self.red_test_tracker = RedTargetTracker() if self.test_red_target else None
+        
+        if self.red_test_tracker is not None:
+            print("[OK] Red science-target test mode enabled")
+        
         self.face_tracker = None
         self.face_nav = None
         if target_mode in ('face', 'red'):
@@ -1845,6 +1985,142 @@ class RLDeployController:
         else:
             self.segmenter = DummySegmenter()
 
+        # --- Initialize terrain cost mapping ---
+        self.semantic_cost_mapper = None
+        self.cost_mapper = None
+        
+        self.latest_costmap = None
+        self.latest_rover_row = None
+        self.latest_rover_col = None
+        
+        if not isinstance(self.segmenter, DummySegmenter):
+            try:
+                self.semantic_cost_mapper = TerrainCostMapper(
+                    map_resolution_m_per_px=COSTMAP_RESOLUTION,
+                    rover_radius_m=ROVER_RADIUS_M,
+                )
+        
+                self.cost_mapper = EgoCostMapper(
+                    cost_mapper=self.semantic_cost_mapper,
+                    hfov_rad=FACE_HFOV_RAD,
+                    grid_size_m=COSTMAP_GRID_SIZE,
+                    resolution_m_per_px=COSTMAP_RESOLUTION,
+                )
+        
+                print("[OK] Terrain cost mapper initialized")
+        
+            except Exception as e:
+                print(f"[WARN] Terrain cost mapper unavailable: {e}")
+                self.cost_mapper = None
+
+        # --- Initialize LingBot-Map persistent memory mapping ---
+        # See LINGBOT_* constants above for the hardware caveats. This is
+        # entirely additive: if it's disabled, fails to construct, or every
+        # batch run fails at runtime, self.memory_mapper stays None (or its
+        # background thread just keeps reporting failures) and the rover
+        # runs on the reactive costmap alone, same as before this existed.
+        self.memory_mapper = None
+        if enable_lingbot_mapping:
+            if not lingbot_model_path or not lingbot_dir:
+                print("[WARN] --lingbot-mapping requires --lingbot-model and "
+                      "--lingbot-dir. Memory mapping disabled.")
+            else:
+                try:
+                    workdir = lingbot_workdir or os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), "lingbot_scratch")
+                    self.memory_mapper = LingbotMemoryMapper(
+                        model_path=lingbot_model_path,
+                        lingbot_dir=lingbot_dir,
+                        workdir=workdir,
+                        map_size_m=LINGBOT_MAP_SIZE_M,
+                        cell_size_m=LINGBOT_CELL_SIZE_M,
+                        keyframe_interval_steps=LINGBOT_KEYFRAME_INTERVAL_STEPS,
+                        batch_size=LINGBOT_BATCH_SIZE,
+                        min_keyframes_for_alignment=LINGBOT_MIN_KEYFRAMES_ALIGN,
+                        obstacle_height_m=LINGBOT_OBSTACLE_HEIGHT_M,
+                        subprocess_timeout_s=LINGBOT_SUBPROCESS_TIMEOUT_S,
+                    )
+                    print(f"[OK] LingBot-Map memory mapper initialized "
+                          f"(workdir: {workdir}) — UNCONFIRMED whether batch "
+                          f"reconstruction actually completes on this hardware; "
+                          f"watch for [LINGBOT-MEM] log lines during the run.")
+                except Exception as e:
+                    print(f"[WARN] LingBot-Map memory mapper unavailable: {e}")
+                    self.memory_mapper = None
+
+        ## --- Initialize science rock targeting ---
+        # Log-only for now: detects a rock target and prints where the gimbal would point.
+        self.science_targeting_enabled = enable_science_targeting
+        self.science_target_interval = science_target_interval
+        self._last_science_target_time = 0.0
+        self.science_point_gimbal = science_point_gimbal
+        self.science_dwell_time = science_dwell_time
+        self.laser_pan_offset = laser_pan_offset
+        self.laser_tilt_offset = laser_tilt_offset
+        self.science_min_distance = science_min_distance
+        self.science_max_distance = science_max_distance
+        self.test_red_target = test_red_target
+
+        if self.science_point_gimbal and not self.science_targeting_enabled and not self.test_red_target:
+            print(
+                "[WARN] --science-point-gimbal was requested, but science targeting is off. "
+                "Use --science-target-rock too.",
+                flush=True,
+            )
+            self.science_point_gimbal = False
+
+        if self.science_point_gimbal and not enable_gimbal:
+            print(
+                "[WARN] --science-point-gimbal was requested, but gimbal control is off. "                    "Remove --no-gimbal to allow science pointing.",
+                    flush=True,
+            )
+            self.science_point_gimbal = False
+
+        self.science_log_path = science_log_path
+        if self.science_targeting_enabled and self.science_log_path is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            self.science_log_path= f"science_targets_{timestamp}.csv"
+
+
+        if self.science_targeting_enabled and not enable_segmentation:
+            print(
+                "[WARN] Science rock targeting needs segmentation enabled. "
+                "Use --segmentation and --seg-model.",
+                flush=True,
+            )
+            
+            self.science_targeting_enabled = False
+
+        if self.science_targeting_enabled and self.science_log_path:
+            with open(self.science_log_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "step",
+                    "timestamp",
+                    "class_name",
+                    "class_name",
+                    "center_x_px",
+                    "center_y_px",
+                    "area_px",
+                    "area_frac",
+                    "distance_m",
+                    "pan_deg",
+                    "tilt_deg",
+                    "score",
+                ])
+            print(f"[OK] Science target CSV log: {self.science_log_path}")
+        if self.science_targeting_enabled:
+            self.science_selector = RockTargetSelector(
+                preferred_class=rock_class,
+                min_distance_m=science_min_distance,
+                max_distance_m=science_max_distance,
+                laser_pan_offset_deg=laser_pan_offset,
+                laser_tilt_offset_deg=laser_tilt_offset,)
+            print("[OK] Science rock targeting initialized (log-only, rock_class={rock_class})")
+        else:
+            self.science_selector = None
+            
+        
         # --- Initialize reward logger ---
         if log_rewards:
             self.reward_logger = RewardLogger(reward_log_path)
@@ -1935,6 +2211,95 @@ class RLDeployController:
         correction = COURSE_CORRECT_GAIN * heading_error
         return max(-COURSE_CORRECT_MAX, min(COURSE_CORRECT_MAX, correction))
 
+    def _update_costmap(self, class_mask, depth_frame):
+        """
+        Generate the newest egocentric metric costmap.
+        """
+    
+        if self.cost_mapper is None:
+            return None
+    
+        try:
+    
+            (
+                self.latest_costmap,
+                self.latest_rover_row,
+                self.latest_rover_col,
+            ) = self.cost_mapper.generate(
+                class_mask,
+                depth_frame,
+            )
+    
+            return self.latest_costmap
+    
+        except Exception as e:
+            print(f"[WARN] Costmap generation failed: {e}")
+            return None
+
+    def _plan_costmap_heading(self):
+        """
+        Evaluate candidate trajectories and return the lowest-cost heading.
+    
+        Positive heading = steer left.
+        Negative heading = steer right.
+        """
+    
+        if self.latest_costmap is None:
+            return 0.0
+    
+        costmap = self.latest_costmap
+    
+        h, w = costmap.shape
+    
+        start_row = self.latest_rover_row
+        start_col = self.latest_rover_col
+    
+        headings = np.linspace(
+            -MAX_HEADING_RAD,
+            MAX_HEADING_RAD,
+            NUM_CANDIDATE_HEADINGS,
+        )
+    
+        best_heading = 0.0
+        best_cost = float("inf")
+    
+        for heading in headings:
+    
+            total_cost = 0.0
+    
+            d = 0.0
+    
+            while d < PATH_LOOKAHEAD_M:
+    
+                row = start_row - int(
+                    (d * np.cos(heading))
+                    / COSTMAP_RESOLUTION
+                )
+    
+                col = start_col + int(
+                    (d * np.sin(heading))
+                    / COSTMAP_RESOLUTION
+                )
+    
+                if (
+                    row < 0
+                    or row >= h
+                    or col < 0
+                    or col >= w
+                ):
+                    total_cost += UNKNOWN_COST_WEIGHT
+                    break
+    
+                total_cost += float(costmap[row, col])
+    
+                d += PATH_STEP_M
+    
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_heading = heading
+    
+        return best_heading
+    
     def _compute_avoidance(self, min_depth, left_depth, right_depth,
                            obj_detected, obj_class, obj_center_x, obj_conf,
                            seg_left_feas=0.8, seg_right_feas=0.8):
@@ -1978,23 +2343,25 @@ class RLDeployController:
             # Remember the obstacle location
             self._record_obstacle_ahead(min_depth)
 
-            if obj_detected and abs(obj_center_x - 0.5) > 0.1:
-                self._avoid_turn_dir = +1 if obj_center_x > 0.5 else -1
-            elif left_depth > right_depth + 0.05:
+            # Use the costmap planner to determine the best steering direction.
+            # NOTE: this now decides direction purely from the costmap — the
+            # older obj_detected/left_depth/right_depth/seg_feasibility branches
+            # that used to pick a direction here were removed by this file's
+            # last edit. obj_detected/obj_conf still widen stop_dist/slow_dist
+            # above, they just no longer influence turn direction. Flagging in
+            # case that was accidental rather than an intended simplification.
+            heading = self._plan_costmap_heading()
+
+            if heading > math.radians(5):
                 self._avoid_turn_dir = +1
-            elif right_depth > left_depth + 0.05:
+            elif heading < -math.radians(5):
                 self._avoid_turn_dir = -1
-            elif abs(left_depth - right_depth) < 0.1:
-                # Depths similar — use segmentation to prefer clearer terrain
-                if seg_left_feas > seg_right_feas + 0.1:
-                    self._avoid_turn_dir = +1  # go left (clearer terrain)
-                elif seg_right_feas > seg_left_feas + 0.1:
-                    self._avoid_turn_dir = -1  # go right (clearer terrain)
-                elif self._avoid_turn_dir == 0:
-                    self._avoid_turn_dir = -1
             else:
+                # Straight ahead is the cheapest path.
+                # Pick the previous direction if we already had one;
+                # otherwise default left.
                 if self._avoid_turn_dir == 0:
-                    self._avoid_turn_dir = -1
+                    self._avoid_turn_dir = +1
 
             self._avoid_steps_left = COMMITTED_TURN_STEPS
             self._avoid_total_steps = 0  # reset total counter for new avoidance
@@ -2144,7 +2511,138 @@ class RLDeployController:
                     seg_rgb = self.camera.get_rgb_frame()
                     if seg_rgb is not None:
                         self.segmenter.analyze(seg_rgb)
+                        # Feed the fresh mask + this cycle's depth into the costmap
+                        # planner. Previously this never ran anywhere, so
+                        # self.latest_costmap stayed None forever and
+                        # _plan_costmap_heading() always returned 0.0 — the
+                        # costmap-based steering in _compute_avoidance was dead code.
+                        seg_mask = getattr(self.segmenter, '_last_mask', None)
+                        if (self.cost_mapper is not None and seg_mask is not None
+                                and depth_frame is not None):
+                            import cv2 as _cv2
+                            resized_mask = _cv2.resize(
+                                seg_mask.astype(np.uint8),
+                                (depth_frame.shape[1], depth_frame.shape[0]),
+                                interpolation=_cv2.INTER_NEAREST)
+                            self._update_costmap(resized_mask, depth_frame)
+
+                            # Fuse the persistent memory layer on top of this
+                            # cycle's fresh reactive costmap, if memory mapping
+                            # is enabled and has accumulated anything yet.
+                            if (self.memory_mapper is not None
+                                    and self.latest_costmap is not None):
+                                try:
+                                    self.latest_costmap = self.memory_mapper.fuse_with_reactive(
+                                        self.latest_costmap, self.latest_rover_row,
+                                        self.latest_rover_col, COSTMAP_RESOLUTION,
+                                        self.odom.x, self.odom.y, self.odom.heading)
+                                except Exception as e:
+                                    print(f"[WARN] Memory-layer fusion failed: {e}")
                 _, seg_left, seg_right = self.segmenter.last_result
+
+                # --- 5b-2. LingBot-Map keyframe capture (own cadence, ---
+                # --- independent of segmentation — see LINGBOT_* constants) ---
+                if self.memory_mapper is not None:
+                    lb_rgb = self.camera.get_rgb_frame()
+                    self.memory_mapper.maybe_capture(
+                        step, lb_rgb, self.odom.x, self.odom.y, self.odom.heading)
+
+                # --- 5b-1. Classroom red-target gimbal test ----
+                if self.test_red_target:
+                    now = time.time()
+
+                    if now - self._last_science_target_time >= self.science_target_interval:
+                        red_rgb = self.camera.get_rgb_frame()
+
+                        if red_rgb is not None:
+                            found, horizontal_angle, distance_m = self.red_test_tracker.detect(
+                                red_rgb, 
+                                depth_frame,
+                            )
+
+                            if found and self.science_min_distance <= distance_m <= self.science_max_distance:
+                                vertical_angle = getattr(
+                                    self.red_test_tracker,
+                                    "_last_vert_angle",
+                                    0.0,
+                                )
+
+                                red_target = RockTarget(
+                                    class_id=-1,
+                                    class_name="red_test_target",
+                                    center_px=(
+                                        int(self.red_test_tracker._last_cx),
+                                        int(self.red_test_tracker._last_cy),
+                                    ),
+                                    area_px=0,
+                                    area_frac=self.red_test_tracker.last_area_frac,
+                                    distance_m=distance_m,
+                                    pan_deg=math.degrees(horizontal_angle) + self.laser_pan_offset,
+                                    tilt_deg=math.degrees(vertical_angle) + self.laser_tilt_offset,
+                                    score=1.0,
+                                )
+
+                                print(
+                                    f"   [RED TEST] target found "
+                                    f"[TIMESTAMP] {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                                    f"dist={distance_m:.2f}m "
+                                    f"pan={red_target.pan_deg:+.1f}deg "
+                                    f"tilt={red_target.tilt_deg:+.1f}deg",
+                                    flush=True,
+                                )
+
+                                self._point_gimbal_at_science_target(red_target)
+                                self._last_science_target_time = now
+
+                                # The camera moved after this loop's depth frame was captured.
+                                # Start a fresh loop before issuing another navigation command.
+
+                                if self.science_point_gimbal:
+                                    step += 1
+                                    continue
+                
+
+                # --- 5b-2. Science rock targeting (log-only) ---
+                # Uses the latest segmentation mask to find a rock target.
+                # This does NOT move the rover, gimbal, or laser yet.
+                if self.science_targeting_enabled and not self.test_red_target and step % SEG_RUN_INTERVAL == 0:
+                    now = time.time()
+                    if now - self._last_science_target_time < self.science_target_interval:
+                        science_target = None
+                    else:
+                        seg_mask = getattr(self.segmenter, "_last_mask", None)
+                        if seg_mask is not None:
+                            science_target = self.science_selector.find_target(seg_mask, depth_frame)
+                            if science_target is not None:
+                                print(
+                                    f" [SCIENCE] target={science_target.class_name} "
+                                    f"center={science_target.center_px} "
+                                    f"dist={science_target.distance_m:.2f}m "
+                                    f"pan={science_target.pan_deg:+.1f}deg "
+                                    f"tilt={science_target.tilt_deg:+.1f}deg "
+                                    f"score={science_target.score:.2f}",
+                                    flush=True,
+                                )
+                            if science_target is not None and self.science_log_path:
+                                with open(self.science_log_path, "a", newline="") as f:
+                                    writer = csv.writer(f)
+                                    writer.writerow([
+                                        step,
+                                        time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        science_target.class_name,
+                                        science_target.center_px[0],
+                                        science_target.center_px[1],
+                                        science_target.area_px,
+                                        f"{science_target.area_frac:.6f}",
+                                        f"{science_target.distance_m:.3f}",
+                                        f"{science_target.pan_deg:.3f}",
+                                        f"{science_target.tilt_deg:.3f}",
+                                        f"{science_target.score:.4f}",
+                                    ])
+                            
+                            self._point_gimbal_at_science_target(science_target)
+                            if science_target is not None:
+                                self._last_science_target_time = now
 
                 # --- 5c. Face/target navigation (before RL inference) ---
                 face_override = None
@@ -2182,14 +2680,24 @@ class RLDeployController:
                     'state': state_vector,
                     'image_front': depth_frame.reshape(128, 128, 1),
                 }
+
                 action, _ = self.model.predict(obs, deterministic=True)
+                
                 raw_linear = float(action[0])
                 raw_angular = float(action[1])
 
                 linear_vel = raw_linear * self.max_speed
                 angular_vel = raw_angular * MAX_ANGULAR_SPEED
-                if linear_vel < 0:
-                    linear_vel = max(linear_vel, -self.max_speed * 0.3)
+                
+                # Continuous terrain preference
+                cost_bias = self._compute_costmap_bias()
+                
+                angular_vel += cost_bias
+
+                # --- 7b. Continuous costmap steering bias ---
+                cost_bias = self._compute_costmap_bias()
+                
+                angular_vel += cost_bias
 
                 # --- 8. Apply overrides (priority: face/target > avoidance > RL) ---
                 # Face override takes HIGHEST priority — it uses direct proportional
@@ -2272,19 +2780,29 @@ class RLDeployController:
                         cv2.imwrite(os.path.join(self.frame_dir, 'depth.jpg'), _dc,
                                     [cv2.IMWRITE_JPEG_QUALITY, 40])
                         # Segmentation overlay — write when available
-                        # 5-class color map matches TerrainSegmenter class indices:
-                        #   0=big hill(red) 1=rock(orange) 2=ground(gray) 3=crater(purple) 4=sky(blue)
+                        # LuSNAR semantic classes:
+                        # 0=regolith 1=big rock 2=small rock 3=crater 4=sky
+                        print("SEG CHECK:",
+                            hasattr(self, "segmenter"),
+                            self.segmenter if hasattr(self, "segmenter") else None,
+                            getattr(self.segmenter, "_last_mask", None) is not None)
                         if (hasattr(self, 'segmenter') and self.segmenter
                                 and hasattr(self.segmenter, '_last_mask')
                                 and self.segmenter._last_mask is not None):
                             _seg_colors = np.array([
-                                [255, 80, 80],    # 0: big hill - hazard (red)
-                                [255, 165, 0],    # 1: rock - hazard (orange)
-                                [50, 50, 50],     # 2: ground - driveable (dark gray)
-                                [128, 0, 255],    # 3: crater - unused in policy (purple)
-                                [135, 206, 235],  # 4: sky - background (light blue)
+                                [180,120,60],    # 0: regolith
+                                [255,0,0],       # 1: big rocks
+                                [120,120,120],   # 2: small rocks
+                                [255,255,0],     # 3: craters
+                                [255,255,255],   # 4: sky
                             ], dtype=np.uint8)
                             _mask = self.segmenter._last_mask
+                            print("SEG MASK DEBUG:",
+                                type(_mask),
+                                _mask.shape,
+                                _mask.dtype,
+                                np.min(_mask),
+                                np.max(_mask))
                             _seg = _seg_colors[_mask]
                             _seg_rgb = _rgb if _rgb is not None else np.zeros(
                                 (_mask.shape[0], _mask.shape[1], 3), dtype=np.uint8)
@@ -2298,8 +2816,8 @@ class RLDeployController:
                                         (255, 255, 255), 1)
                             cv2.imwrite(os.path.join(self.frame_dir, 'seg.jpg'), _seg,
                                         [cv2.IMWRITE_JPEG_QUALITY, 40])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"SEGMENTATION DISPLAY ERROR: {e}")
 
                 # --- 11. Log ---
                 step += 1
@@ -2425,6 +2943,31 @@ Examples:
                         help=f'Stop distance for face target in meters (default: {FACE_STOP_DISTANCE})')
     parser.add_argument('--segmentation', action='store_true',
                         help='Enable UNet terrain segmentation for avoidance')
+    parser.add_argument('--science-target-rock', action='store_true', help='Enable log-only rock science target detection')
+    parser.add_argument('--rock-class', type=str, default='big', choices=['big', 'small', 'either'], help='Rock class preference for science targeting')
+    parser.add_argument('--science-min-distance', type=float, default=0.5,
+                        help='Minimum rock target distance in meters')
+    parser.add_argument('--science-max-distance', type=float, default=2.5,
+                        help='Maximize rock target distance in meters')
+    parser.add_argument('--laser-pan-offset', type=float, default=0.0,
+                        help='Laser pan calibration offset in degrees')
+    parser.add_argument('--laser-tilt-offset', type=float, default=0.0,
+                        help='Laser tilt calibration offset in degrees')
+    parser.add_argument('--science-target-interval', type=float, default=5.0,
+                        help='Minimum seconds betwen science target logs')
+    parser.add_argument('--science-log', type=str, default=None,
+                        help='Path for science target CSV log')
+    parser.add_argument('--science-point-gimbal', action='store_true',
+                        help='Actually point the gimbal at detected science targets')
+    parser.add_argument('--science-dwell-time', type=float, default=1.0,
+                        help='Seconds to dwell on a science targe before recenetering')
+    parser.add_argument('--test-science-gimbal', action='store_true',
+                        help='Test science gimbal pointing with a fake target, then exit')
+    parser.add_argument('--test-science-target', action='store_true',
+                        help='Test science target selection with a fake segmentation mask, then exit')
+    parser.add_argument('--test-red-target', action='store_true',
+                        help='Classroom test mode: treat a red object as a science target')
+
     parser.add_argument('--seg-model', type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                              'mark model', 'unet_lunar_segmentation.pth'),
@@ -2435,6 +2978,18 @@ Examples:
                         help='Path for reward CSV log (default: rewards_YYYYMMDD_HHMMSS.csv)')
     parser.add_argument('--frame-dir', type=str, default=None,
                         help='Write camera frames to this dir for web UI streaming')
+    parser.add_argument('--lingbot-mapping', action='store_true',
+                        help='Enable LingBot-Map persistent memory mapping '
+                             '(UNCONFIRMED on this hardware — 4GB RAM, no CUDA; '
+                             'requires --lingbot-model and --lingbot-dir)')
+    parser.add_argument('--lingbot-model', type=str, default=None,
+                        help='Path to LingBot-Map checkpoint (e.g. lingbot-map.pt)')
+    parser.add_argument('--lingbot-dir', type=str, default=None,
+                        help='Path where the lingbot-map repo was cloned '
+                             '(needs demo_render/batch_demo.py inside it)')
+    parser.add_argument('--lingbot-workdir', type=str, default=None,
+                        help='Scratch dir for keyframes + batch outputs '
+                             '(default: ./lingbot_scratch next to this script)')
 
     args = parser.parse_args()
 
@@ -2457,6 +3012,81 @@ Examples:
             print(f"  {i}...")
             time.sleep(1)
 
+    if args.test_science_gimbal:
+        fake_target = RockTarget(
+            class_id=3,
+            class_name="big_rock",
+            center_px=(60, 50),
+            area_px=400,
+            area_frac=0.04,
+            distance_m=1.5,
+            pan_deg=10.0,
+            tilt_deg=-5.0,
+            score=1.0,
+        )
+
+        class FakeController:
+            science_point_gimbal = args.science_point_gimbal
+            dry_run = args.dry_run
+            science_dwell_time = args.science_dwell_time
+            base = None
+
+        print("[TEST] Running fake science gimbal target test")
+        RLDeployController._point_gimbal_at_science_target(FakeController(), fake_target)
+        print("[TEST] Science gimbal test complete")
+        sys.exit(0)
+
+
+    if args.test_science_target:
+        print("[TEST] Running fake science target selection test")
+
+        # Fake segmentation mask:
+        # 0 = ground, 3 = big rock
+        mask = np.zeros((100, 100), dtype=np.uint8)
+        mask[40:60, 55:75] = 3
+
+        # Fake depth frame in meters
+        depth = np.ones((100, 100), dtype=np.float32) * 1.5
+
+        selector = RockTargetSelector(
+            preferred_class=args.rock_class,
+            min_distance_m=args.science_min_distance,
+            max_distance_m=args.science_max_distance,
+            laser_pan_offset_deg=args.laser_pan_offset,
+            laser_tilt_offset_deg=args.laser_tilt_offset,
+        )
+
+        science_target = selector.find_target(mask, depth)
+
+        if science_target is None:
+            print("[TEST] No science target found")
+            sys.exit(1)
+        
+        print(
+            f"[TEST] Found target={science_target.class_name} "
+            f"[TIMESTAMP] {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"center={science_target.center_px} "
+            f"dist={science_target.distance_m:.2f}m "
+            f"pan={science_target.pan_deg:+.1f}deg "
+            f"tilt={science_target.tilt_deg:+.1f}deg "
+            f"score={science_target.score:.2f}"
+        )
+
+        if args.science_point_gimbal:
+            class FakeController:
+                science_point_gimbal = True
+                dry_run = args.dry_run
+                science_dwell_time = args.science_dwell_time
+                base = None
+            
+            RLDeployController._point_gimbal_at_science_target(
+                FakeController(),
+                science_target,
+            )
+
+        print("[TEST] Science target selection test complete")
+        sys.exit(0)
+
     controller = RLDeployController(
         model_path=args.model,
         demo=args.demo,
@@ -2472,7 +3102,24 @@ Examples:
         log_rewards=args.log_rewards,
         reward_log_path=args.reward_log,
         frame_dir=args.frame_dir,
+        enable_science_targeting=args.science_target_rock,
+        rock_class=args.rock_class,
+        science_min_distance=args.science_min_distance,
+        science_max_distance=args.science_max_distance,
+        laser_pan_offset=args.laser_pan_offset,
+        laser_tilt_offset=args.laser_tilt_offset,
+        science_target_interval=args.science_target_interval,
+        science_log_path=args.science_log,
+        science_point_gimbal=args.science_point_gimbal,
+        science_dwell_time=args.science_dwell_time,
+        test_red_target=args.test_red_target,
+        enable_lingbot_mapping=args.lingbot_mapping,
+        lingbot_model_path=args.lingbot_model,
+        lingbot_dir=args.lingbot_dir,
+        lingbot_workdir=args.lingbot_workdir,
     )
+
+    
 
     # Create frame dir if specified
     if args.frame_dir:
