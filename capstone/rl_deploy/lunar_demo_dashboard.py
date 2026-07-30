@@ -12,27 +12,7 @@ printing to the terminal:
     |   Cost Map            |  LingBot Memory Map  |
     +----------------------+----------------------+
     Mission decision text printed below the panel.
-
-Two honesty notes baked into this script on purpose (see
-LINGBOT_INVESTIGATION_SUMMARY / chatgpt_summary_2 for the background):
-
-1. Cost Map panel: these demo images are random/unordered stills with no
-   depth or odometry, so we CANNOT run EgoCostMapper's real top-down metric
-   projection (that needs a depth frame). Instead this uses
-   TerrainCostMapper.generate() directly on the perspective-space class
-   mask, which is an honest "which pixels look hazardous" view, not a
-   true top-down map. Don't present this as the metric costmap.
-
-2. LingBot Memory Map panel: instead of a static placeholder, this now
-   shows LingBot-Map's REAL, LIVE status when you pass --lingbot-model and
-   --lingbot-dir: whether the checkpoint actually loaded on this hardware,
-   and (best-effort, non-blocking) whether any background batch
-   reconstruction has produced anything yet. Odometry fed into it for this
-   demo is SYNTHETIC (steadily incrementing x) since these images have no
-   real trajectory — that's flagged in the panel too, so nobody mistakes a
-   real reconstruction for a fake one. Without --lingbot-model/--lingbot-dir
-   the panel just says LingBot wasn't configured for this run.
-
+    
 Usage:
     python3 lunar_demo_dashboard.py                  # save PNGs, no live window
     python3 lunar_demo_dashboard.py --show            # also open a live cv2 window
