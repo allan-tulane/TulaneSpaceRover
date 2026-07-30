@@ -4,7 +4,7 @@ rover_connection_guide.md lists the way to connect and control the rover.
 
 Future Considerations (7/30/2026) - Connor Benoit
 1. Segmentation could still use improvement, I believe. Particularly with respect to shadows, dust, and other environmental hazards.
-2. As of now, there are some mislabeling with what each semantic class is, due to the retraining undertaken for mobilenetv3. The code should function fine, its mostly the notes that can cause confusion. I believe TerrainCostMapper is the most accurate labeling mask. 
+2. As of now, there are some mislabeling with what each semantic class is, due to the retraining undertaken for mobilenetv3. The code should function fine, its mostly the notes that can cause confusion. The lunar_demo has the most accurate labeling mask. 
 3. There are still many kinks to iron out with the persistent mapping. I only managed to get it going my last week of the internship. I encourage verification and optimizations from whoever works on it next. The rover may not be using it to its full potential.
 4. Science Targeting mode uses "big rocks" and "small rocks." Jake worked on that side of things. I am not sure if small rocks should be an option or how well that meshes with the segmentation model since it only really sees "big rocks" and identifies what would be "small rocks" as rough terrain.
 5. Please document and backup everything the best you can.
