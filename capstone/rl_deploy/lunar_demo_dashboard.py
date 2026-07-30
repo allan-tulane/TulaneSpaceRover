@@ -48,9 +48,9 @@ STRIP_H = 90  # bottom text strip for the mission decision
 # Corrected 5-class mapping (0=ground,1=big rock,2=small rock,3=crater,4=sky)
 # - matches TerrainSegmenter.CLASS_* after the mapping fix.
 CLASS_COLORS_BGR = {
-    0: (110, 170, 200),   # ground/regolith - tan
-    1: (0, 0, 200),       # big rock - red
-    2: (0, 140, 255),     # small rock - orange
+    0: (110, 170, 200),   # hills - tan
+    1: (0, 0, 200),       # rock - red
+    2: (0, 140, 255),     # regolith - orange
     3: (200, 0, 200),     # crater - magenta
     4: (235, 206, 135),   # sky - light blue
 }
