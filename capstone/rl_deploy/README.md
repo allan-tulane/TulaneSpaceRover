@@ -49,7 +49,7 @@ Team Crater builds an autonomous navigation system for a six-wheeled rover that 
 
 | Component | Details |
 |-----------|---------|
-| **Rover** | Waveshare UGV Rover PT — 6-wheel differential drive |
+| **Rover** | Waveshare UGV Rover PT — 6-wheel differential drive |https://www.amazon.com/Jetson-Orin-Nano-Omnidirectional-4GB/dp/B0DM4J6C48?ref_=ast_bl_cpl_dp 
 | **Compute** | NVIDIA Jetson Orin Nano (4 GB), Ubuntu 22.04 |
 | **Lower Controller** | ESP32 — motors, encoders, IMU, voltage sensing |
 | **Camera** | OAK-D Lite — stereo depth + RGB (128x128 depth, 640x480 RGB) |
